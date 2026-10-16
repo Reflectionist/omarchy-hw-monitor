@@ -26,12 +26,17 @@ function toNumberSafe(value, fallback) {
 }
 
 // Sensor paths from the probe become FileView reads, so accept only the two
-// virtual filesystems the probe actually scans — a tampered hw-probe must not
-// point the shell at arbitrary readable files.
+// virtual filesystems the probe actually scans — and only clean absolute
+// forms: no '.'/'..' traversal, no empty interior segments, so a tampered
+// hw-probe cannot point the shell at arbitrary readable files.
 var SENSOR_PATH = /^\/(sys|proc)\/[A-Za-z0-9._:\/-]+$/
 function safePath(value) {
-  if (typeof value !== "string") return undefined
-  return SENSOR_PATH.test(value) ? value : undefined
+  if (typeof value !== "string" || !SENSOR_PATH.test(value)) return undefined
+  var parts = value.split("/")
+  for (var i = 1; i < parts.length; i++) {
+    if (parts[i] === "" || parts[i] === "." || parts[i] === "..") return undefined
+  }
+  return value
 }
 
 function cleanString(value, maxLen) {
@@ -83,9 +88,11 @@ function parseProbe(raw) {
       var card = cleanString(g.card, 64)
       if (card !== undefined) gpu.card = card
       gpu.index = Math.max(0, Math.floor(toNumberSafe(g.index, 0)))
-      // Absolute path of the nvidia-smi the probe resolved; same discipline
-      // as sensor paths — a shell path only, never anything relative.
-      if (typeof g.nvidiaPath === "string" && /^\/[A-Za-z0-9._\/+-]+$/.test(g.nvidiaPath)) {
+      // Absolute path of the nvidia-smi the probe resolved: must be a clean
+      // absolute path (no relative names, no traversal); the widget falls
+      // back to a bare 'nvidia-smi' when it is missing or malformed.
+      if (typeof g.nvidiaPath === "string" && /^\/[A-Za-z0-9._\/+-]+$/.test(g.nvidiaPath)
+          && g.nvidiaPath.indexOf("..") === -1) {
         gpu.nvidiaPath = g.nvidiaPath
       }
       for (var k = 0; k < PATH_KEYS.length; k++) {
@@ -320,7 +327,9 @@ function parseProcTop(raw, maxN) {
     return out
   }
   if (!parsed || !(parsed.procs instanceof Array)) return out
-  var groupedBy = String(parsed.groupedBy === undefined || parsed.groupedBy === null ? "none" : parsed.groupedBy)
+  var rawGroupedBy = parsed.groupedBy
+  var groupedBy = (typeof rawGroupedBy === "string" || typeof rawGroupedBy === "number")
+    ? String(rawGroupedBy) : "none"
   out.groupedBy = PROC_GROUPEDS.indexOf(groupedBy) === -1 ? "none" : groupedBy
   for (var i = 0; i < parsed.procs.length && out.rows.length < limit; i++) {
     var p = parsed.procs[i]

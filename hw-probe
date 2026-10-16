@@ -30,9 +30,10 @@ json_str() {
   local s=${1//\\/\\\\}
   s=${s//\"/\\\"}
   s=${s//	/ }
-  s=${s//$'\r'/ }
-  s=${s//$'\n'/ }
-  s=${s//$'\e'/ }
+  # Any remaining C0 control (CR, newline, ESC, ...) would produce invalid
+  # one-line JSON; the consumer degrades to defaults on invalid JSON rather
+  # than misparsing, but there is no reason to emit it in the first place.
+  s=${s//[[:cntrl:]]/}
   printf '"%s"' "$s"
 }
 
