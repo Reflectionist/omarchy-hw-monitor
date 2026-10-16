@@ -13,12 +13,43 @@ function toNumber(value, fallback) {
   return isFinite(n) ? n : (fallback === undefined ? 0 : fallback)
 }
 
+// Coerce only scalars: String()/Number() on an object whose JSON carried an
+// own "toString" key throws "Cannot convert object to primitive value", which
+// would take a fail-soft parser down with it. Subprocess output is untrusted,
+// so every field of every row goes through this, not toNumber directly.
+function toNumberSafe(value, fallback) {
+  var t = typeof value
+  if (t !== "number" && t !== "string" && t !== "boolean") {
+    return fallback === undefined ? 0 : fallback
+  }
+  return toNumber(value, fallback)
+}
+
+// Sensor paths from the probe become FileView reads, so accept only the two
+// virtual filesystems the probe actually scans — a tampered hw-probe must not
+// point the shell at arbitrary readable files.
+var SENSOR_PATH = /^\/(sys|proc)\/[A-Za-z0-9._:\/-]+$/
+function safePath(value) {
+  if (typeof value !== "string") return undefined
+  return SENSOR_PATH.test(value) ? value : undefined
+}
+
+function cleanString(value, maxLen) {
+  if (typeof value !== "string") return undefined
+  var s = value.trim()
+  if (s === "") return undefined
+  return s.length > maxLen ? s.substring(0, maxLen) : s
+}
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
 }
 
 // ------------------------------------------------------------------- probe
 
+// Probe output is one JSON line from a helper we spawn, but treat it as
+// untrusted anyway: keep only known keys with expected types, and accept a
+// sensor path only when it lives under /sys or /proc.
 function parseProbe(raw) {
   var empty = { ok: false, cpu: { model: "CPU", cores: 0, threads: 0 }, gpus: [] }
   var text = String(raw || "").trim()
@@ -26,11 +57,44 @@ function parseProbe(raw) {
   try {
     var parsed = JSON.parse(text)
     if (!parsed || typeof parsed !== "object") return empty
-    return {
-      ok: true,
-      cpu: parsed.cpu || empty.cpu,
-      gpus: parsed.gpus instanceof Array ? parsed.gpus : []
+    var rawCpu = parsed.cpu && typeof parsed.cpu === "object" ? parsed.cpu : {}
+    var cpu = {
+      model: cleanString(rawCpu.model, 128) || "CPU",
+      cores: Math.max(0, Math.floor(toNumberSafe(rawCpu.cores, 0))),
+      threads: Math.max(0, Math.floor(toNumberSafe(rawCpu.threads, 0)))
     }
+    var tempPath = safePath(rawCpu.tempPath)
+    if (tempPath !== undefined) {
+      cpu.tempPath = tempPath
+      cpu.tempLabel = cleanString(rawCpu.tempLabel, 64)
+    }
+    var gpus = []
+    var rawGpus = parsed.gpus instanceof Array ? parsed.gpus : []
+    var PATH_KEYS = ["busyPath", "vramUsedPath", "vramTotalPath", "tempPath",
+                     "powerPath", "fanPath", "clockPath"]
+    for (var i = 0; i < rawGpus.length; i++) {
+      var g = rawGpus[i]
+      if (!g || typeof g !== "object") continue
+      var gpu = {}
+      var kind = cleanString(g.kind, 64)
+      if (kind !== undefined) gpu.kind = kind
+      var name = cleanString(g.name, 256)
+      if (name !== undefined) gpu.name = name
+      var card = cleanString(g.card, 64)
+      if (card !== undefined) gpu.card = card
+      gpu.index = Math.max(0, Math.floor(toNumberSafe(g.index, 0)))
+      // Absolute path of the nvidia-smi the probe resolved; same discipline
+      // as sensor paths — a shell path only, never anything relative.
+      if (typeof g.nvidiaPath === "string" && /^\/[A-Za-z0-9._\/+-]+$/.test(g.nvidiaPath)) {
+        gpu.nvidiaPath = g.nvidiaPath
+      }
+      for (var k = 0; k < PATH_KEYS.length; k++) {
+        var path = safePath(g[PATH_KEYS[k]])
+        if (path !== undefined) gpu[PATH_KEYS[k]] = path
+      }
+      gpus.push(gpu)
+    }
+    return { ok: true, cpu: cpu, gpus: gpus }
   } catch (e) {
     return empty
   }
@@ -146,7 +210,10 @@ function parseNvidia(raw) {
   function value(index) {
     var text = String(parts[index] || "").trim()
     if (text === "" || text.indexOf("N/A") !== -1) return -1
-    return toNumber(text, -1)
+    // No sensor exceeds 1e9 in its own unit; anything larger (or Infinity
+    // after the MiB multiplication) is a malformed reading, not data.
+    var n = toNumber(text, -1)
+    return isFinite(n) && n <= 1e9 ? n : -1
   }
 
   return {
@@ -258,23 +325,24 @@ function parseProcTop(raw, maxN) {
   for (var i = 0; i < parsed.procs.length && out.rows.length < limit; i++) {
     var p = parsed.procs[i]
     if (!p || typeof p !== "object") continue
-    var pid = Math.floor(toNumber(p.pid, -1))
+    var pid = Math.floor(toNumberSafe(p.pid, -1))
     if (pid <= 0 || pid > 4194304) continue
-    var name = String(p.name === undefined || p.name === null ? "" : p.name).replace(/[\r\n\t]/g, " ").trim()
-    if (name === "") name = "?"
-    if (name.length > PROC_NAME_MAX) name = name.substring(0, PROC_NAME_MAX)
-    var count = Math.floor(toNumber(p.count, 1))
+    var rawName = typeof p.name === "string" || typeof p.name === "number"
+      ? String(p.name) : ""
+    var name = cleanString(rawName.replace(/[\r\n\t]/g, " "), PROC_NAME_MAX)
+    if (name === undefined) name = "?"
+    var count = Math.floor(toNumberSafe(p.count, 1))
     if (!isFinite(count) || count < 1) count = 1
     if (count > 4096) count = 4096
-    var rssKib = Math.floor(toNumber(p.rssKib, -1))
+    var rssKib = Math.floor(toNumberSafe(p.rssKib, -1))
     if (rssKib < 0 || rssKib > 68719476736) continue
     out.rows.push({
       pid: pid,
       name: name,
       count: count,
-      cpu: clamp(toNumber(p.cpu, 0), 0, 100),
+      cpu: clamp(toNumberSafe(p.cpu, 0), 0, 100),
       rssKib: rssKib,
-      memPct: clamp(toNumber(p.memPct, 0), 0, 100)
+      memPct: clamp(toNumberSafe(p.memPct, 0), 0, 100)
     })
   }
   return out
