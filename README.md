@@ -40,7 +40,7 @@ Clicking the widget opens an Omarchy keyboard-driven popup panel anchored to the
 - **60s CPU load sparkline** — live history trend buffer sampled while open (zero background cost when closed).
 - **Processor details** — full CPU model name (without cutoff), load, clock frequency, dynamic temperature color, and 1m/5m/15m load average meters.
 - **Memory breakdown** — used/total GiB visual meter, available, cache, and swap usage.
-- **Top processi** — i processi principali ordinati per RAM o CPU (switch nell'header), con quota e CPU% per processo, barre in rampa blu verso l'accent del tema. Il toggle Raggruppa li collassa per applicazione (scope systemd, fallback per nome) con conteggi e somme. Campionati solo a pannello aperto (zero costo a pannello chiuso).
+- **Top processes** — the top processes sorted by RAM or CPU (switch in the header), with share and CPU% per process, blue ramp bars toward the theme accent. The Group toggle collapses them per application (systemd scope, name fallback) with counts and sums. Sampled only while the panel is open (zero cost while closed).
 - **Graphics metrics** — full GPU card name, load, dynamic temperature color, VRAM meter, power draw (W), fan RPM, and clock speeds.
 - **Keyboard navigation** — `Escape` to close, `Tab`/`Shift+Tab` to switch panels, `r` to resample, `c`/`f` to toggle °C/°F.
 
@@ -213,8 +213,9 @@ default, which opens the built-in panel instead).
 omarchy plugin remove meviusisback.hw-monitor
 ```
 
-That drops it from the bar, deletes the plugin, and keeps no state — there is
-nothing else to clean up.
+That drops it from the bar and deletes the plugin. Per-widget settings live in
+the shell's own config (`~/.config/omarchy/shell.json`) and are left for the
+shell to prune — remove the widget's entry there if you want a clean slate.
 
 ## License
 
