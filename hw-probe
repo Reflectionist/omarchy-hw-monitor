@@ -23,8 +23,8 @@ read_first() {
 
 # JSON string escaping. Sensor and PCI names come from the kernel and lspci,
 # so backslashes and quotes are unlikely but not impossible. Control
-# characters (CR, ESC, and a stray newline from any future non-line-based
-# source) would produce invalid one-line JSON, so they become spaces: the
+# characters (any C0 byte: CR, newline, ESC, ...) are stripped entirely and
+# tabs become spaces, so the payload is always one clean JSON line — the
 # consumer degrades to defaults on invalid JSON rather than misparsing.
 json_str() {
   local s=${1//\\/\\\\}

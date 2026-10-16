@@ -87,6 +87,13 @@ Item {
   readonly property string procTopPath: pluginDir + "/proc_top.py"
   property double _lastProcTopTry: 0
   property double _lastProcTopOk: 0
+  // Stale-length baselines for the byte guards: StdioCollector.text still
+  // holds the PREVIOUS run's output until this run's first byte arrives, so
+  // each guard compares against the length recorded at spawn — without a
+  // baseline a slow-first-byte run would be killed for the last run's size.
+  property int _probeBase: 0
+  property int _nvidiaBase: 0
+  property int _procTopBase: 0
   // Veto anti-teardown: nessun handler tocca più lo stato dopo l'inizio
   // della distruzione (finestra di reload). Vedi onDestruction in fondo.
   property bool _destroyed: false
@@ -122,6 +129,7 @@ Item {
 
   function refreshProbe() {
     probeProcess.command = [probePath]
+    _probeBase = String(probeOut.text).length
     probeWatchdog.restart()
     probeProcess.running = true
   }
@@ -195,6 +203,7 @@ Item {
                              "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw",
                              "--format=csv,noheader,nounits",
                              "--id=" + String(gpuInfo.index !== undefined ? gpuInfo.index : 0)]
+    _nvidiaBase = String(nvidiaProcess.stdout.text).length
     nvidiaWatchdog.restart()
     nvidiaProcess.running = true
   }
@@ -220,6 +229,7 @@ Item {
     var cmd = ["/usr/bin/python3", procTopPath, "--top", String(topProcCount), "--sort", topProcSort]
     if (topProcGroup) cmd.push("--group")
     procTopProcess.command = cmd
+    _procTopBase = String(procTopOut.text).length
     procTopProcess.running = true
     procTopWatchdog.restart()
   }
@@ -318,14 +328,14 @@ Item {
         root.sample()
       }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       probeWatchdog.stop()
       probeKillTimer.stop()
       // A killed or crashed probe leaves discovery empty for the whole
       // session otherwise: retry slowly until one run succeeds.
-      if (!root.probe.ok) probeRetryTimer.start()
+      if (!root.probe.ok) probeRetryTimer.restart()
     }
   }
 
@@ -335,7 +345,7 @@ Item {
       waitForEnd: false
       onStreamFinished: { if (!root._destroyed) root.applyNvidia(text) }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       nvidiaWatchdog.stop()
@@ -380,7 +390,7 @@ Item {
         }
       }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       procTopWatchdog.stop()
@@ -460,15 +470,20 @@ Item {
 
   // Byte-cap guards, one per helper: poll the collected text length while
   // the process runs and stop it past the cap, escalating through the same
-  // kill timers the watchdogs use. The running binding stops the guard when
-  // the process ends, so a guard never outlives its run.
+  // kill timers the watchdogs use. Two rules keep the check honest: the
+  // baseline recorded at spawn separates the previous run's stale text from
+  // this run's bytes (text is only reset once THIS run writes its first
+  // byte), and stderr counts toward the cap too. The running binding stops
+  // the guard when the process ends, so a guard never outlives its run.
   Timer {
     id: procTopByteGuard
     interval: 100
     repeat: true
     running: procTopProcess.running
     onTriggered: {
-      if (String(procTopOut.text).length > 16384) {
+      var len = String(procTopOut.text).length
+      var err = String(procTopProcess.stderr.text).length
+      if ((len !== root._procTopBase && len > 16384) || err > 16384) {
         procTopProcess.running = false
         procTopKillTimer.restart()
       }
@@ -481,7 +496,9 @@ Item {
     repeat: true
     running: probeProcess.running
     onTriggered: {
-      if (String(probeOut.text).length > 65536) {
+      var len = String(probeOut.text).length
+      var err = String(probeProcess.stderr.text).length
+      if ((len !== root._probeBase && len > 65536) || err > 65536) {
         probeProcess.running = false
         probeKillTimer.restart()
       }
@@ -494,7 +511,9 @@ Item {
     repeat: true
     running: nvidiaProcess.running
     onTriggered: {
-      if (String(nvidiaProcess.stdout.text).length > 65536) {
+      var len = String(nvidiaProcess.stdout.text).length
+      var err = String(nvidiaProcess.stderr.text).length
+      if ((len !== root._nvidiaBase && len > 65536) || err > 65536) {
         nvidiaProcess.running = false
         nvidiaKillTimer.restart()
       }
@@ -502,8 +521,9 @@ Item {
   }
 
   // Slow retry for discovery: armed only when a probe run ended without
-  // producing a valid payload (killed, crashed, or malformed), and never
-  // re-armed once a run succeeds. One shot per arm — each exit re-arms.
+  // producing a valid payload (killed, crashed, or malformed), restart() so
+  // each failed exit resets the 30 s deadline, and never re-armed once a
+  // run succeeds (onTriggered checks probe.ok).
   Timer {
     id: probeRetryTimer
     interval: 30000
