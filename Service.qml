@@ -122,6 +122,7 @@ Item {
 
   function refreshProbe() {
     probeProcess.command = [probePath]
+    probeWatchdog.restart()
     probeProcess.running = true
   }
 
@@ -187,10 +188,14 @@ Item {
 
   function sampleNvidia() {
     if (_destroyed || nvidiaProcess.running) return
-    nvidiaProcess.command = ["nvidia-smi",
+    // hw-probe reports the absolute path it resolved, so the bar never
+    // re-resolves nvidia-smi from the session PATH at sample time.
+    var bin = gpuInfo && gpuInfo.nvidiaPath ? String(gpuInfo.nvidiaPath) : "nvidia-smi"
+    nvidiaProcess.command = [bin,
                              "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw",
                              "--format=csv,noheader,nounits",
                              "--id=" + String(gpuInfo.index !== undefined ? gpuInfo.index : 0)]
+    nvidiaWatchdog.restart()
     nvidiaProcess.running = true
   }
 
@@ -295,11 +300,20 @@ Item {
 
   // ------------------------------------------------------------- processes
 
+  // Byte cap for every helper stream: the parser's read signal delivers each
+  // chunk as it arrives, so a runaway helper is stopped once it has pushed
+  // more than the cap (untampered output is one JSON line of at most a few
+  // KB) instead of buffering into the shell's memory until the OOM killer.
   Process {
     id: probeProcess
     stdout: StdioCollector {
       id: probeOut
       waitForEnd: true
+      property int bytes: 0
+      onRead: (data) => {
+        bytes += String(data).length
+        if (bytes > 65536 && probeProcess.running) probeProcess.running = false
+      }
       onStreamFinished: {
         if (root._destroyed) return
         root.probe = Model.parseProbe(text)
@@ -309,13 +323,28 @@ Item {
       }
     }
     stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      if (root._destroyed) return
+      probeWatchdog.stop()
+    }
   }
 
   Process {
     id: nvidiaProcess
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: { if (!root._destroyed) root.applyNvidia(text) } }
+    stdout: StdioCollector {
+      waitForEnd: true
+      property int bytes: 0
+      onRead: (data) => {
+        bytes += String(data).length
+        if (bytes > 65536 && nvidiaProcess.running) nvidiaProcess.running = false
+      }
+      onStreamFinished: { if (!root._destroyed) root.applyNvidia(text) }
+    }
     stderr: StdioCollector { waitForEnd: true }
-    onExited: if (root._destroyed) return
+    onExited: {
+      if (root._destroyed) return
+      nvidiaWatchdog.stop()
+    }
   }
 
   // Worker top-processi: esecuzione diretta (mai sh -c), stdout limitato a una
@@ -326,10 +355,24 @@ Item {
     stdout: StdioCollector {
       id: procTopOut
       waitForEnd: true
+      property int bytes: 0
+      onRead: (data) => {
+        bytes += String(data).length
+        if (bytes > 16384 && procTopProcess.running) procTopProcess.running = false
+      }
       onStreamFinished: {
         if (root._destroyed) return
-        procTopWatchdog.stop()
-        var res = Model.parseProcTop(text, 12)
+        // parseProcTop degrades fail-soft on every shape it documents, but an
+        // exotic value type can still throw: catch it so the section flags a
+        // failure instead of freezing silently. The watchdog is stopped in
+        // onExited, not here — a helper that closes stdout and then hangs
+        // must still be killed.
+        var res = null
+        try { res = Model.parseProcTop(text, 12) } catch (e) { res = null }
+        if (!res) {
+          root.procTopFailed = true
+          return
+        }
         var list = res.rows
         if (list.length > 0 || String(text).indexOf('"procs"') !== -1) {
           root.topProcs = list
@@ -350,12 +393,16 @@ Item {
     onExited: {
       if (root._destroyed) return
       procTopWatchdog.stop()
+      procTopKillTimer.stop()
     }
   }
 
   // Watchdog kill-before-next-tick: 0.4 s di lettura interna << 2 s << 3 s di
-  // throttle. Uccide il runaway e marca lo stallo; il latch si pulisce anche
-  // in onExited così non resta mai incastrato se lo spawn fallisce.
+  // throttle. The first trigger sends SIGTERM via running=false; the kill
+  // timer escalates to SIGKILL for a helper that ignores it. Both stay armed
+  // until onExited — a helper that finishes its output and then hangs must
+  // still be killed. nvidia and probe get the same two-stage treatment: a
+  // wedged nvidia-smi or a hung hw-probe used to latch running=true forever.
   Timer {
     id: procTopWatchdog
     interval: 2000
@@ -363,7 +410,60 @@ Item {
     onTriggered: {
       if (root._destroyed) return
       if (procTopProcess.running) procTopProcess.running = false
+      procTopKillTimer.restart()
       root.procTopFailed = true
+    }
+  }
+
+  Timer {
+    id: procTopKillTimer
+    interval: 1000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed) return
+      if (procTopProcess.running) procTopProcess.signal(9)
+    }
+  }
+
+  Timer {
+    id: nvidiaWatchdog
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed) return
+      if (nvidiaProcess.running) nvidiaProcess.running = false
+      nvidiaKillTimer.restart()
+    }
+  }
+
+  Timer {
+    id: nvidiaKillTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed) return
+      if (nvidiaProcess.running) nvidiaProcess.signal(9)
+    }
+  }
+
+  Timer {
+    id: probeWatchdog
+    interval: 8000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed) return
+      if (probeProcess.running) probeProcess.running = false
+      probeKillTimer.restart()
+    }
+  }
+
+  Timer {
+    id: probeKillTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed) return
+      if (probeProcess.running) probeProcess.signal(9)
     }
   }
 
@@ -372,6 +472,11 @@ Item {
   Component.onDestruction: {
     _destroyed = true
     procTopWatchdog.stop()
+    procTopKillTimer.stop()
+    nvidiaWatchdog.stop()
+    nvidiaKillTimer.stop()
+    probeWatchdog.stop()
+    probeKillTimer.stop()
     if (procTopProcess.running) procTopProcess.running = false
     if (nvidiaProcess.running) nvidiaProcess.running = false
     if (probeProcess.running) probeProcess.running = false
