@@ -300,20 +300,16 @@ Item {
 
   // ------------------------------------------------------------- processes
 
-  // Byte cap for every helper stream: the parser's read signal delivers each
-  // chunk as it arrives, so a runaway helper is stopped once it has pushed
-  // more than the cap (untampered output is one JSON line of at most a few
-  // KB) instead of buffering into the shell's memory until the OOM killer.
+  // Byte caps: StdioCollector never emits the parser's read signal, so the
+  // cap is enforced by polling the collected text length from a short repeat
+  // Timer (verified on Quickshell 0.3.1: a 64 MB spewer is stopped within one
+  // polling interval). Untampered output is one JSON line of at most a few
+  // KB, so a cap crossing always means a runaway or tampered helper.
   Process {
     id: probeProcess
     stdout: StdioCollector {
       id: probeOut
-      waitForEnd: true
-      property int bytes: 0
-      onRead: (data) => {
-        bytes += String(data).length
-        if (bytes > 65536 && probeProcess.running) probeProcess.running = false
-      }
+      waitForEnd: false
       onStreamFinished: {
         if (root._destroyed) return
         root.probe = Model.parseProbe(text)
@@ -326,24 +322,24 @@ Item {
     onExited: {
       if (root._destroyed) return
       probeWatchdog.stop()
+      probeKillTimer.stop()
+      // A killed or crashed probe leaves discovery empty for the whole
+      // session otherwise: retry slowly until one run succeeds.
+      if (!root.probe.ok) probeRetryTimer.start()
     }
   }
 
   Process {
     id: nvidiaProcess
     stdout: StdioCollector {
-      waitForEnd: true
-      property int bytes: 0
-      onRead: (data) => {
-        bytes += String(data).length
-        if (bytes > 65536 && nvidiaProcess.running) nvidiaProcess.running = false
-      }
+      waitForEnd: false
       onStreamFinished: { if (!root._destroyed) root.applyNvidia(text) }
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: {
       if (root._destroyed) return
       nvidiaWatchdog.stop()
+      nvidiaKillTimer.stop()
     }
   }
 
@@ -354,12 +350,7 @@ Item {
     id: procTopProcess
     stdout: StdioCollector {
       id: procTopOut
-      waitForEnd: true
-      property int bytes: 0
-      onRead: (data) => {
-        bytes += String(data).length
-        if (bytes > 16384 && procTopProcess.running) procTopProcess.running = false
-      }
+      waitForEnd: false
       onStreamFinished: {
         if (root._destroyed) return
         // parseProcTop degrades fail-soft on every shape it documents, but an
@@ -467,6 +458,62 @@ Item {
     }
   }
 
+  // Byte-cap guards, one per helper: poll the collected text length while
+  // the process runs and stop it past the cap, escalating through the same
+  // kill timers the watchdogs use. The running binding stops the guard when
+  // the process ends, so a guard never outlives its run.
+  Timer {
+    id: procTopByteGuard
+    interval: 100
+    repeat: true
+    running: procTopProcess.running
+    onTriggered: {
+      if (String(procTopOut.text).length > 16384) {
+        procTopProcess.running = false
+        procTopKillTimer.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: probeByteGuard
+    interval: 100
+    repeat: true
+    running: probeProcess.running
+    onTriggered: {
+      if (String(probeOut.text).length > 65536) {
+        probeProcess.running = false
+        probeKillTimer.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: nvidiaByteGuard
+    interval: 100
+    repeat: true
+    running: nvidiaProcess.running
+    onTriggered: {
+      if (String(nvidiaProcess.stdout.text).length > 65536) {
+        nvidiaProcess.running = false
+        nvidiaKillTimer.restart()
+      }
+    }
+  }
+
+  // Slow retry for discovery: armed only when a probe run ended without
+  // producing a valid payload (killed, crashed, or malformed), and never
+  // re-armed once a run succeeds. One shot per arm — each exit re-arms.
+  Timer {
+    id: probeRetryTimer
+    interval: 30000
+    repeat: false
+    onTriggered: {
+      if (root._destroyed || root.probe.ok) return
+      refreshProbe()
+    }
+  }
+
   // Cleanup anti-teardown: ferma worker e watchdog e alza il veto, così
   // nessun callback in volo tocca lo stato durante la finalizzazione (reload).
   Component.onDestruction: {
@@ -477,6 +524,7 @@ Item {
     nvidiaKillTimer.stop()
     probeWatchdog.stop()
     probeKillTimer.stop()
+    probeRetryTimer.stop()
     if (procTopProcess.running) procTopProcess.running = false
     if (nvidiaProcess.running) nvidiaProcess.running = false
     if (probeProcess.running) probeProcess.running = false
