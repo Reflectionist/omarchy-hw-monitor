@@ -630,6 +630,7 @@ Panel {
           anchors.centerIn: parent
           visible: modelData.iconRotation !== 0
           rotation: modelData.iconRotation
+          textFormat: Text.PlainText
           text: modelData.icon
           color: group.isTempCell
             ? root.tempColor(modelData.tempC)
@@ -707,6 +708,7 @@ Panel {
           visible: root.clockIcon !== ""
           height: root.contentHeight
           leftPadding: Style.space(2)
+          textFormat: Text.PlainText
           text: root.clockIcon
           color: root.warm(root.dim, modelData.severity)
           font.family: root.fontFamily
@@ -718,6 +720,7 @@ Panel {
 
         Text {
           height: root.contentHeight
+          textFormat: Text.PlainText
           text: modelData.clock
           color: root.warm(root.dim, modelData.severity)
           font.family: root.fontFamily
