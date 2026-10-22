@@ -39,24 +39,39 @@ function safePath(value) {
   return value
 }
 
-// Control and format characters have no place in a label, and the dangerous
-// ones are invisible. Covered: C0/C1 controls (ANSI escapes, NUL, DEL), soft
-// hyphen, the bidi marks and overrides (U+061C, U+200E-200F, U+202A-202E), the
-// line/paragraph separators U+2028-2029 (a one-line payload's cheapest way to
-// fake a second row), zero-width space/joiners, the deprecated format block
-// U+2060-206F, interlinear annotation, and the astral tag characters
-// U+E0000-E007F. A process may name itself with any of them, and an override
-// visually reverses the rest of the row. Replaced — not dropped — with the same
-// visible placeholder proc_top.py uses, so a tampered helper shows its hand
-// instead of silently rendering clean. ZWNJ/ZWJ (U+200C-200D) are stripped too:
-// they would preserve multi-codepoint emoji, but in a single-row label they are
-// pure spoofing surface and a broken emoji is the cheaper loss.
-var DISPLAY_BAD = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFFF9-\uFFFC\u{E0000}-\u{E007F}]/gu
+// Control, format and blank-rendering characters have no place in a label.
+// Covered: C0/C1 controls (ANSI escapes, NUL, DEL), soft hyphen, the bidi marks
+// and overrides (U+061C, U+200E-200F, U+202A-202E), the line/paragraph
+// separators U+2028-2029 (a one-line payload's cheapest way to fake a second
+// row), zero-width space/joiners, the deprecated format block U+2060-206F,
+// interlinear annotation, the astral tag characters U+E0000-E007F, and the
+// code points that are invisible BY DESIGN — Hangul fillers U+115F/U+1160,
+// Khmer inherent vowels U+17B4-17B5, Mongolian free variation selectors
+// U+180B-180D, braille blank U+2800, Hangul filler U+3164, halfwidth Hangul
+// filler U+FFA0, shorthand format controls U+1BCA0-1BCA3, musical format
+// controls U+1D173-1D17A. A process may name itself with any of them, and an
+// override visually reverses the rest of the row.
+//
+// This is a blacklist at the DISPLAY layer and a blacklist can never be
+// exhaustive — the authoritative allowlist lives in proc_top.py sanitize_name,
+// which is where process names actually originate. This layer exists so that a
+// tampered or replaced helper still cannot render something invisible; it is
+// deliberately permissive for real hardware strings, which must survive
+// (brackets, parens, accents, CJK, Nerd Font private-use glyphs).
+//
+// Replaced — not dropped — with the visible '·' proc_top.py uses, so a tampered
+// helper shows its hand. Two deliberate tidiness trades: ZWJ/ZWNJ (U+200C-200D)
+// are stripped, which breaks multi-codepoint emoji, and U+FE00-FE0F variation
+// selectors are kept, because they choose a glyph's presentation rather than
+// hiding content.
+var DISPLAY_BAD = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\u2800\u3164\uFEFF\uFFA0\uFFF9-\uFFFC\u{1BCA0}-\u{1BCA3}\u{1D173}-\u{1D17A}\u{E0000}-\u{E007F}]/gu
 
 function cleanString(value, maxLen) {
   if (typeof value !== "string") return undefined
   // Trim BEFORE replacing: U+FEFF is whitespace to trim(), so a leading BOM is
   // discarded as it always was instead of turning into a visible placeholder.
+  // Interior U+FEFF still has to be neutralised, which is why it is in the
+  // class even though this trim already handles it at the edges.
   var s = value.trim().replace(DISPLAY_BAD, "\u00b7")
   s = s.trim()
   if (s === "") return undefined
