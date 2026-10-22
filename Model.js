@@ -40,17 +40,25 @@ function safePath(value) {
 }
 
 // Control and format characters have no place in a label, and the dangerous
-// ones are invisible: C0/C1 controls (ANSI escapes, NUL, DEL), bidi overrides
-// (U+202A-U+202E, U+2066-U+2069, U+061C), zero-width joiners/spaces and BOM.
-// A process may name itself with any of them, and a bidi override visually
-// reverses the rest of the row. Replaced — not dropped — with the same visible
-// placeholder proc_top.py uses, so a tampered helper shows its hand instead of
-// silently rendering clean.
-var DISPLAY_BAD = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g
+// ones are invisible. Covered: C0/C1 controls (ANSI escapes, NUL, DEL), soft
+// hyphen, the bidi marks and overrides (U+061C, U+200E-200F, U+202A-202E), the
+// line/paragraph separators U+2028-2029 (a one-line payload's cheapest way to
+// fake a second row), zero-width space/joiners, the deprecated format block
+// U+2060-206F, interlinear annotation, and the astral tag characters
+// U+E0000-E007F. A process may name itself with any of them, and an override
+// visually reverses the rest of the row. Replaced — not dropped — with the same
+// visible placeholder proc_top.py uses, so a tampered helper shows its hand
+// instead of silently rendering clean. ZWNJ/ZWJ (U+200C-200D) are stripped too:
+// they would preserve multi-codepoint emoji, but in a single-row label they are
+// pure spoofing surface and a broken emoji is the cheaper loss.
+var DISPLAY_BAD = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFFF9-\uFFFC\u{E0000}-\u{E007F}]/gu
 
 function cleanString(value, maxLen) {
   if (typeof value !== "string") return undefined
-  var s = value.replace(DISPLAY_BAD, "\u00b7").trim()
+  // Trim BEFORE replacing: U+FEFF is whitespace to trim(), so a leading BOM is
+  // discarded as it always was instead of turning into a visible placeholder.
+  var s = value.trim().replace(DISPLAY_BAD, "\u00b7")
+  s = s.trim()
   if (s === "") return undefined
   return s.length > maxLen ? s.substring(0, maxLen) : s
 }
@@ -221,31 +229,36 @@ function parseNvidia(raw) {
   var line = String(raw || "").trim().split("\n")[0]
   if (!line) return null
   var parts = line.split(",")
-  // Exactly the five fields this widget asks for in its own --query-gpu argv.
-  // `< 4` used to accept a misaligned line: one stray comma early in the line
-  // (a locale decimal comma, a name containing one) shifts every later field
-  // into the wrong slot, and a silently misaligned sample is worse than none —
-  // it renders a real temperature as VRAM and a real VRAM figure as watts.
-  // The caller keeps the last good sample when this returns null.
+  // Exactly the five fields this widget asks for in its own --query-gpu argv
+  // (Service.qml sampleNvidia). The Process pins LC_ALL=C, so the numbers are
+  // always '.'-separated and a decimal comma cannot add a sixth field; any
+  // other count therefore means a shifted field, a stray delimiter or a driver
+  // change, and the caller keeps the last good sample on null.
   if (parts.length !== 5) return null
 
-  function value(index) {
+  // Out of range means "not a reading", not "clamp to the nearest plausible
+  // figure": saturating 1e9 % to 100 % and 999 °C to 150 °C prints credible
+  // numbers the UI shows verbatim, while -1 already renders as a dash. Negative
+  // values are equally impossible for any of these sensors.
+  function value(index, max) {
     var text = String(parts[index] || "").trim()
     if (text === "" || text.indexOf("N/A") !== -1) return -1
-    // No sensor exceeds 1e9 in its own unit; anything larger (or Infinity
-    // after the MiB multiplication) is a malformed reading, not data.
     var n = toNumber(text, -1)
-    return isFinite(n) && n <= 1e9 ? n : -1
+    return isFinite(n) && n >= 0 && n <= max ? n : -1
   }
 
-  // Clamped to plausible sensor ranges: a percentage above 100 or a fanless
-  // card reporting 8192 W is a parse artifact, and the UI prints it verbatim.
+  var vramUsed = value(2, 1048576)
+  var vramTotal = value(3, 1048576)
+  // Used larger than installed cannot be a real reading — it is the signature
+  // of a shifted field. Drop the sample rather than draw a >100 % VRAM bar.
+  if (vramUsed >= 0 && vramTotal >= 0 && vramUsed > vramTotal) return null
+
   return {
-    busy: clamp(value(0), -1, 100),
-    tempC: clamp(value(1), -1, 150),
-    vramUsedBytes: value(2) >= 0 ? value(2) * 1048576 : -1,
-    vramTotalBytes: value(3) >= 0 ? value(3) * 1048576 : -1,
-    watts: clamp(value(4), -1, 2000)
+    busy: value(0, 100),
+    tempC: value(1, 150),
+    vramUsedBytes: vramUsed >= 0 ? vramUsed * 1048576 : -1,
+    vramTotalBytes: vramTotal >= 0 ? vramTotal * 1048576 : -1,
+    watts: value(4, 2000)
   }
 }
 

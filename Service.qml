@@ -85,6 +85,16 @@ Item {
     return String(value).trim().toLowerCase() !== "false"
   }
   readonly property string procTopPath: pluginDir + "/proc_top.py"
+  // nvidia-smi formats its CSV numbers with the session locale, so a
+  // comma-decimal locale (de_DE, fr_FR, it_IT) turns "55.30" into "55,30" —
+  // a sixth comma-separated field, after which every reading is one slot off.
+  // Pinning C makes the parse locale-proof instead of making the parser
+  // tolerate a shape it cannot detect. Held in a `var` because
+  // Process.environment is a QVariantHash and an object literal infers
+  // QVariantMap, which qmllint reports as a type mismatch; the runtime accepts
+  // it either way (verified by probe: the child sees LC_ALL=C and keeps its
+  // inherited PATH, so the locale is overridden and nothing else is lost).
+  readonly property var cleanLocale: ({ "LC_ALL": "C", "LANG": "C" })
   property double _lastProcTopTry: 0
   property double _lastProcTopOk: 0
   // Stale-length baselines for the byte guards: StdioCollector.text still
@@ -357,6 +367,7 @@ Item {
 
   Process {
     id: nvidiaProcess
+    environment: root.cleanLocale
     stdout: StdioCollector {
       id: nvidiaOut
       waitForEnd: false
