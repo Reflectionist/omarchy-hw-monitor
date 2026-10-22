@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Hardware Monitor",
-    "description": "GPU, CPU, temperature, and RAM load as sleek icon readouts, vertical gauges, or spelled out words. Left click opens the system telemetry panel with top processes by RAM.",
+    "description": "GPU, CPU, temperature, and RAM load as sleek icon readouts, vertical gauges, or spelled out words. Left click opens the system telemetry panel with top processes by RAM, plus per-tab hints for Chromium-family browsers (reads their process memory where the kernel allows it, and caches the labels in a 0600 state file in your runtime dir while the panel is open).",
     "category": "System",
     "allowMultiple": true,
     "defaultSection": "right",
