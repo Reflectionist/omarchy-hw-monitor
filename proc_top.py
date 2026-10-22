@@ -332,9 +332,14 @@ MEM_SCAN_MAX_REGIONS = 400
 MEM_SCAN_BUDGET_S = 0.6
 
 # Solo l'host: la path non discrimina (pesarla peggiorava le etichette reali).
-URL_HOST_RE = re.compile(rb"https?://([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)")
+# Un eventuale userinfo (la parte prima della chiocciola) non fa parte
+# dell'host: il gruppo `(?:[^/@\s]*@)?` lo consuma senza catturarlo, così il
+# dominio mostrato è quello DOPO la chiocciola. Senza questo, una sola URL
+# bastava a far mostrare al pannello il dominio civetta scritto nella parte
+# prima — non serve nemmeno il voto di frequenza.
+URL_HOST_RE = re.compile(rb"https?://(?:[^/@\s]*@)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)")
 CMD_TYPE_RE = re.compile(r"--type=([a-zA-Z][a-zA-Z0-9-]*)")
-APP_URL_RE = re.compile(r"--app=(?:https?://)?([a-zA-Z0-9.-]+)")
+APP_URL_RE = re.compile(r"--app=(?:https?://)?(?:[^/@\s]*@)?([a-zA-Z0-9.-]+)")
 APP_ID_RE = re.compile(r"--app-id=([a-zA-Z0-9]+)")
 UTIL_SUB_RE = re.compile(r"--utility-sub-type=([a-zA-Z0-9_.]+)")
 
@@ -551,16 +556,32 @@ def _pid_starttime(pid):
 
 
 def _fit_label(comm, tag):
-    """`comm [tag]` entro NAME_MAX, accorciando il tag: la parentesi chiude."""
+    """`comm [tag]` entro NAME_MAX, accorciando il tag: la parentesi chiude.
+
+    Un tag accorciato si taglia su un punto e si chiude con `·`, così un host
+    troncato non si legge come un host completo: senza il segno, un prefisso
+    tipo `banca.example.aaa.evil.examp` sembra un dominio vero. La `·` non è in
+    NAME_OK, quindi sanitize_name la sostituisce con se stessa e sopravvive.
+    """
     room = NAME_MAX - len(comm) - 3
     if room < 3:
         return sanitize_name(comm)
-    return sanitize_name("%s [%s]" % (comm, tag[:room]))
+    if len(tag) > room:
+        cut = tag[:max(1, room - 1)]
+        dot = cut.rfind(".")
+        if dot > 0:
+            cut = cut[:dot]
+        tag = cut + "\u00b7"
+    return sanitize_name("%s [%s]" % (comm, tag))
 
 
-# Nessun accesso a /proc/<pid>/mem (yama ptrace_scope, altro utente): una
-# volta accertato, inutile riprovare per ogni renderer dello stesso poll.
-_MEM_SCAN_DENIED = [False]
+# Nessun latch globale sull'accesso a /proc/<pid>/mem. La leggibilità è una
+# proprietà del singolo processo: i figli Chromium chiamano
+# PR_SET_PTRACER_ANY e sono leggibili anche con yama ptrace_scope=1, mentre
+# main/zygote/gpu non lo sono. Un latch rendeva l'ordine delle righe — cioè
+# l'ordinamento per RSS/CPU — responsabile di quale browser perdeva
+# l'etichetta. Un open() fallito costa una syscall, e il budget vero è già
+# dentro _scan_hosts (byte, regioni, scadenza).
 
 
 def _scan_hosts(pid, deadline):
@@ -578,7 +599,6 @@ def _scan_hosts(pid, deadline):
     try:
         mem = open("/proc/%d/mem" % pid, "rb", 0)
     except PermissionError:
-        _MEM_SCAN_DENIED[0] = True
         return counts, False
     except OSError:
         return counts, False
@@ -616,7 +636,6 @@ def _scan_hosts(pid, deadline):
                     mem.seek(start)
                     chunk = mem.read(min(size, MEM_SCAN_CHUNK))
                 except PermissionError:
-                    _MEM_SCAN_DENIED[0] = True
                     complete = False
                     break
                 except OSError:
@@ -708,17 +727,14 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
             label = _fit_label(comm, ctype)
 
     if label is None:
-        if _MEM_SCAN_DENIED[0]:
+        counts, complete = _scan_hosts(pid, deadline)
+        if not counts:
             label, resolved = _fit_label(comm, "tab"), False
         else:
-            counts, complete = _scan_hosts(pid, deadline)
-            if not counts:
-                label, resolved = _fit_label(comm, "tab"), False
-            else:
-                top_host = max(counts, key=lambda h: counts[h])
-                label = _fit_label(comm, top_host)
-                # Campione troncato: etichetta usata, ma con TTL corto.
-                resolved = complete
+            top_host = max(counts, key=lambda h: counts[h])
+            label = _fit_label(comm, top_host)
+            # Campione troncato: etichetta usata, ma con TTL corto.
+            resolved = complete
 
     if cache_key:
         cache[cache_key] = {"label": label, "ts": now, "resolved": resolved}
@@ -760,7 +776,6 @@ def main(argv):
 
     cache = _load_browser_cache()
     now = time.time()
-    _MEM_SCAN_DENIED[0] = False
     prev_snap = cache.get("_snap")
     used_cached_snap = False
 
