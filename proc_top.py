@@ -358,6 +358,13 @@ APP_AUTH_RE = re.compile(r"--app=(?:https?://)?([^/?#\s\"'<>]{1,255})")
 # la porta rsplit(b'@'), non l'ancora né il prefisso.
 _URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _HOSTISH_AFTER = re.compile(rb"[a-z0-9._\-%]")
+# Cioè la stessa classe della cattura: se il byte dopo l'authority sarebbe
+# ANCORA potuto entrarci, la cattura si è fermata al tetto di 255 e va scartata.
+# Un `not after not in b"/?#"` non basta: spazio, virgoletta e `<>` chiudono
+# l'authority senza essere `/?#`, e con quella prova un'authority completa di
+# 255 byte seguita da uno spazio perdeva l'etichetta.
+_AUTH_MORE = re.compile(rb"[^/?#\s\"'<>]")
+_AUTH_MORE_STR = re.compile(r"[^/?#\s\"'<>]")
 
 
 def _authority_host(auth):
@@ -701,15 +708,16 @@ def _scan_hosts(pid, deadline):
                 scanned += len(chunk)
                 for found in URL_AUTH_RE.finditer(chunk):
                     auth = found.group(1)
-                    # La cattura è limitata a 255 byte: se ha toccato il tetto e
-                    # il byte dopo non è un delimitatore, si è fermata DENTRO
-                    # l'authority (tipicamente nel userinfo) e rsplit
-                    # restituirebbe la civetta. Il test giusto è "si è fermata a
-                    # un delimitatore?", non "era lunga": una cattura di 255 byte
-                    # seguita da `/` è completa e va tenuta.
+                    # La cattura è limitata a 255 byte. Il test giusto non è
+                    # "era lunga" ma "si è fermata a un confine?": se il byte
+                    # dopo sarebbe ancora entrato nell'authority, la cattura è
+                    # stata tagliata dal tetto e rsplit restituirebbe il
+                    # userinfo; se è un delimitatore (`/`, `?`, `#`, spazio,
+                    # virgoletta, `<>`) l'authority è completa e va tenuta. Se
+                    # il chunk finisce lì il dato è ambiguo e si rinuncia.
                     if len(auth) == 255:
                         after = chunk[found.end(1):found.end(1) + 1]
-                        if after and after not in b"/?#":
+                        if not after or _AUTH_MORE.match(after):
                             continue
                     raw_host = _authority_host(auth)
                     if raw_host is None:
@@ -762,7 +770,8 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
 
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
-            cmdline = fh.read(4096).decode("utf-8", "ignore").replace("\0", " ")
+            raw_cmdline = fh.read(4096)
+        cmdline = raw_cmdline.decode("utf-8", "ignore").replace("\0", " ")
     except OSError:
         return comm
 
@@ -778,7 +787,15 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
         truncated = False
         if len(app_auth) == 255:
             tail = cmdline[app_match.end(1):app_match.end(1) + 1]
-            truncated = bool(tail) and tail not in "/?#"
+            if tail:
+                # Troncata solo se il carattere dopo sarebbe ancora entrato
+                # nell'authority. Uno spazio o una virgoletta lo chiudono, quindi
+                # l'authority è completa; `/`, `?`, `#` pure.
+                truncated = bool(_AUTH_MORE_STR.match(tail))
+            else:
+                # Nessun carattere dopo: ambiguo. Se la lettura ha toccato i
+                # 4096 byte, la cattura può essere stata tagliata dal limite.
+                truncated = len(raw_cmdline) >= 4096
         if not truncated:
             raw_app = _authority_host(app_auth.encode("utf-8", "ignore"))
             host = raw_app.decode("ascii", "ignore") if raw_app else ""
