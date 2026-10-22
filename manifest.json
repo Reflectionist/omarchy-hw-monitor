@@ -375,7 +375,7 @@
         "type": "string",
         "label": "Left click runs",
         "defaultValue": "",
-        "description": "Custom command to run on left click. Leave empty to open the built-in system telemetry panel."
+        "description": "Shell command run on left click via 'bash -lc' as you, unsandboxed. Leave empty to open the built-in system telemetry panel. Only set it from a source you trust: anything that can write this widget's settings can run code on your next click."
       }
     ]
   }

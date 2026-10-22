@@ -85,17 +85,36 @@ Item {
     return String(value).trim().toLowerCase() !== "false"
   }
   readonly property string procTopPath: pluginDir + "/proc_top.py"
+  // nvidia-smi formats its CSV numbers with the session locale, so a
+  // comma-decimal locale (de_DE, fr_FR, it_IT) turns "55.30" into "55,30" —
+  // a sixth comma-separated field, after which every reading is one slot off.
+  // Pinning C makes the parse locale-proof instead of making the parser
+  // tolerate a shape it cannot detect. Held in a `var` because
+  // Process.environment is a QVariantHash and an object literal infers
+  // QVariantMap, which qmllint reports as a type mismatch; the runtime accepts
+  // it either way (verified by probe: the child sees LC_ALL=C and keeps its
+  // inherited PATH, so the locale is overridden and nothing else is lost).
+  readonly property var cleanLocale: ({ "LC_ALL": "C", "LANG": "C" })
   property double _lastProcTopTry: 0
   property double _lastProcTopOk: 0
   // Stale-length baselines for the byte guards: StdioCollector.text still
   // holds the PREVIOUS run's output until this run's first byte arrives, so
   // each guard compares against the length recorded at spawn — without a
   // baseline a slow-first-byte run would be killed for the last run's size.
+  // stderr needs the same treatment as stdout: a collector that is never
+  // written to again keeps its old text forever, so a bare `err > cap` latches
+  // true after one oversized run and kills every later run of that helper at
+  // the first poll, for the rest of the session.
   property int _probeBase: 0
   property int _nvidiaBase: 0
   property int _procTopBase: 0
+  property int _probeErrBase: 0
+  property int _nvidiaErrBase: 0
+  property int _procTopErrBase: 0
   // Veto anti-teardown: nessun handler tocca più lo stato dopo l'inizio
-  // della distruzione (finestra di reload). Vedi onDestruction in fondo.
+  // della distruzione (finestra di reload). Ogni callback che può mutare
+  // stato — Process/StdioCollector, watchdog, kill timer, byte guard, sample
+  // timer, start() — controlla questo flag. Vedi onDestruction in fondo.
   property bool _destroyed: false
 
   // Cumulative jiffies from the previous tick. CPU usage is the ratio between
@@ -130,6 +149,7 @@ Item {
   function refreshProbe() {
     probeProcess.command = [probePath]
     _probeBase = String(probeOut.text).length
+    _probeErrBase = String(probeErr.text).length
     probeWatchdog.restart()
     probeProcess.running = true
   }
@@ -203,7 +223,8 @@ Item {
                              "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw",
                              "--format=csv,noheader,nounits",
                              "--id=" + String(gpuInfo.index !== undefined ? gpuInfo.index : 0)]
-    _nvidiaBase = String(nvidiaProcess.stdout.text).length
+    _nvidiaBase = String(nvidiaOut.text).length
+    _nvidiaErrBase = String(nvidiaErr.text).length
     nvidiaWatchdog.restart()
     nvidiaProcess.running = true
   }
@@ -230,17 +251,22 @@ Item {
     if (topProcGroup) cmd.push("--group")
     procTopProcess.command = cmd
     _procTopBase = String(procTopOut.text).length
+    _procTopErrBase = String(procTopErr.text).length
     procTopProcess.running = true
     procTopWatchdog.restart()
   }
 
   // Cambio sort/raggruppamento → refresh immediato (throttle azzerato).
   // Le guardie in refreshProcTop restano valide: a pannello chiuso non parte.
+  // Il veto è ripetuto qui perché questi due handler scrivono _lastProcTopTry
+  // prima di chiamare: senza, muterebbero stato su un oggetto già distrutto.
   onTopProcSortChanged: {
+    if (_destroyed) return
     _lastProcTopTry = 0
     refreshProcTop()
   }
   onTopProcGroupChanged: {
+    if (_destroyed) return
     _lastProcTopTry = 0
     refreshProcTop()
   }
@@ -328,7 +354,7 @@ Item {
         root.sample()
       }
     }
-    stderr: StdioCollector { waitForEnd: false }
+    stderr: StdioCollector { id: probeErr; waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       probeWatchdog.stop()
@@ -341,11 +367,13 @@ Item {
 
   Process {
     id: nvidiaProcess
+    environment: root.cleanLocale
     stdout: StdioCollector {
+      id: nvidiaOut
       waitForEnd: false
       onStreamFinished: { if (!root._destroyed) root.applyNvidia(text) }
     }
-    stderr: StdioCollector { waitForEnd: false }
+    stderr: StdioCollector { id: nvidiaErr; waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       nvidiaWatchdog.stop()
@@ -390,7 +418,7 @@ Item {
         }
       }
     }
-    stderr: StdioCollector { waitForEnd: false }
+    stderr: StdioCollector { id: procTopErr; waitForEnd: false }
     onExited: {
       if (root._destroyed) return
       procTopWatchdog.stop()
@@ -470,20 +498,24 @@ Item {
 
   // Byte-cap guards, one per helper: poll the collected text length while
   // the process runs and stop it past the cap, escalating through the same
-  // kill timers the watchdogs use. Two rules keep the check honest: the
-  // baseline recorded at spawn separates the previous run's stale text from
-  // this run's bytes (text is only reset once THIS run writes its first
-  // byte), and stderr counts toward the cap too. The running binding stops
-  // the guard when the process ends, so a guard never outlives its run.
+  // kill timers the watchdogs use. Two rules keep the check honest, and both
+  // apply to stderr exactly as to stdout: the baseline recorded at spawn
+  // separates the previous run's stale text from this run's bytes (a collector
+  // is only reset once THIS run writes its first byte, and one that is never
+  // written to again keeps its old length forever), and stderr counts toward
+  // the cap too. The running binding stops the guard when the process ends,
+  // and the teardown veto stops it touching state during a reload.
   Timer {
     id: procTopByteGuard
     interval: 100
     repeat: true
     running: procTopProcess.running
     onTriggered: {
+      if (root._destroyed) return
       var len = String(procTopOut.text).length
-      var err = String(procTopProcess.stderr.text).length
-      if ((len !== root._procTopBase && len > 16384) || err > 16384) {
+      var err = String(procTopErr.text).length
+      if ((len !== root._procTopBase && len > 16384) ||
+          (err !== root._procTopErrBase && err > 16384)) {
         procTopProcess.running = false
         procTopKillTimer.restart()
       }
@@ -496,9 +528,11 @@ Item {
     repeat: true
     running: probeProcess.running
     onTriggered: {
+      if (root._destroyed) return
       var len = String(probeOut.text).length
-      var err = String(probeProcess.stderr.text).length
-      if ((len !== root._probeBase && len > 65536) || err > 65536) {
+      var err = String(probeErr.text).length
+      if ((len !== root._probeBase && len > 65536) ||
+          (err !== root._probeErrBase && err > 65536)) {
         probeProcess.running = false
         probeKillTimer.restart()
       }
@@ -511,9 +545,11 @@ Item {
     repeat: true
     running: nvidiaProcess.running
     onTriggered: {
-      var len = String(nvidiaProcess.stdout.text).length
-      var err = String(nvidiaProcess.stderr.text).length
-      if ((len !== root._nvidiaBase && len > 65536) || err > 65536) {
+      if (root._destroyed) return
+      var len = String(nvidiaOut.text).length
+      var err = String(nvidiaErr.text).length
+      if ((len !== root._nvidiaBase && len > 65536) ||
+          (err !== root._nvidiaErrBase && err > 65536)) {
         nvidiaProcess.running = false
         nvidiaKillTimer.restart()
       }
@@ -534,8 +570,12 @@ Item {
     }
   }
 
-  // Cleanup anti-teardown: ferma worker e watchdog e alza il veto, così
-  // nessun callback in volo tocca lo stato durante la finalizzazione (reload).
+  // Cleanup anti-teardown: ferma worker, watchdog, byte guard e sample timer,
+  // poi alza il veto, così nessun callback in volo tocca lo stato durante la
+  // finalizzazione (reload). Il veto va alzato per primo: è l'unica cosa che
+  // impedisce a un timer già accodato di rieseguire start() e rilanciare un
+  // helper dopo che i watchdog sono stati spenti — un figlio che resterebbe
+  // orfano perché nessuno lo ucciderebbe più.
   Component.onDestruction: {
     _destroyed = true
     procTopWatchdog.stop()
@@ -545,6 +585,14 @@ Item {
     probeWatchdog.stop()
     probeKillTimer.stop()
     probeRetryTimer.stop()
+    // Fermati esplicitamente: il loro `running` è legato a quello dei Process,
+    // e dipendere dalla ri-valutazione del binding significherebbe affidare lo
+    // spegnimento all'ordine di valutazione invece che a una dichiarazione.
+    procTopByteGuard.stop()
+    probeByteGuard.stop()
+    nvidiaByteGuard.stop()
+    sampleTimer.stop()
+    warmupSampleTimer.stop()
     if (procTopProcess.running) procTopProcess.running = false
     if (nvidiaProcess.running) nvidiaProcess.running = false
     if (probeProcess.running) probeProcess.running = false
@@ -553,27 +601,38 @@ Item {
   // -------------------------------------------------------------- lifetime
 
   Timer {
+    id: sampleTimer
     interval: root.intervalSec * 1000
     running: root.active
     repeat: true
-    onTriggered: root.sample()
+    onTriggered: {
+      if (root._destroyed) return
+      root.sample()
+    }
   }
 
   // CPU usage needs two samples. Take the second one shortly after startup so
   // the widget shows a real number immediately rather than a dash.
   Timer {
+    id: warmupSampleTimer
     interval: 350
     running: root.active
     repeat: false
-    onTriggered: root.sample()
+    onTriggered: {
+      if (root._destroyed) return
+      root.sample()
+    }
   }
 
   function start() {
-    if (!active || probeProcess.running) return
+    if (_destroyed || !active || probeProcess.running) return
     sample()
     refreshProbe()
   }
 
-  onActiveChanged: if (active) start()
+  // `active` follows the widget's screen membership, which collapses to true
+  // for a moment while the window/screen is being torn down or hotplugged —
+  // exactly the window where start() must not run.
+  onActiveChanged: if (!_destroyed && active) start()
   Component.onCompleted: start()
 }
