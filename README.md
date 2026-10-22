@@ -74,7 +74,7 @@ label welded to its figure, ~230px.
 | CPU temperature | `hwmon` | die/package sensor, picked by scoring (`k10temp` `Tdie`/`Tctl`, `coretemp` `Package id 0`, `zenpower`, ThinkPad, ARM SoC, then `acpitz`) |
 | GPU | the card's own `sysfs` | load, edge temperature, VRAM, board power, fan, core clock |
 | Load average | `/proc/loadavg` | 1/5/15 minute |
-| Browser tab hints | `/proc/<pid>/mem` of Chromium-family processes | read-only, and only for the processes the kernel lets the shell attach to; the most frequent host in the renderer's memory becomes the `[domain]` tag, and rows read `[tab]` when the attach is refused |
+| Browser tab hints | `/proc/<pid>/mem` of Chromium-family processes | read-only, and only for the processes the kernel lets the shell attach to. With the Group toggle off, the most frequent host in the renderer's memory becomes the `[domain]` tag, and rows read `[tab]` when the attach is refused or nothing was found |
 
 An NVIDIA card is the exception: it reports none of this through sysfs, so it is
 polled through `nvidia-smi` on the same interval.
