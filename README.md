@@ -165,7 +165,7 @@ omarchy bar set meviusisback.hw-monitor fahrenheit true --json
 | `criticalPercent` | int | `90` | Load threshold where the gauge glows and color reaches full urgent. |
 | `warnTempC` | int | `75` | Temperature threshold (°C) where figures warm toward urgent. |
 | `criticalTempC` | int | `90` | Temperature threshold (°C) where temperature turns hot urgent red. |
-| `clickCommand` | string | `""` | Command to run on left click. Empty opens the built-in system panel popup. |
+| `clickCommand` | string | `""` | Shell command run on left click via `bash -lc` as you, unsandboxed. Empty opens the built-in system panel popup. Only set it from a source you trust: whatever can write this widget's settings can run code on your next click. |
 | `monitors` | array/string | `[]` | Connector names to draw on (e.g. `["DP-1"]`). Empty draws on all screens. |
 
 ## IPC

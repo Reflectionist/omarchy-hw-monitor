@@ -39,9 +39,18 @@ function safePath(value) {
   return value
 }
 
+// Control and format characters have no place in a label, and the dangerous
+// ones are invisible: C0/C1 controls (ANSI escapes, NUL, DEL), bidi overrides
+// (U+202A-U+202E, U+2066-U+2069, U+061C), zero-width joiners/spaces and BOM.
+// A process may name itself with any of them, and a bidi override visually
+// reverses the rest of the row. Replaced — not dropped — with the same visible
+// placeholder proc_top.py uses, so a tampered helper shows its hand instead of
+// silently rendering clean.
+var DISPLAY_BAD = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g
+
 function cleanString(value, maxLen) {
   if (typeof value !== "string") return undefined
-  var s = value.trim()
+  var s = value.replace(DISPLAY_BAD, "\u00b7").trim()
   if (s === "") return undefined
   return s.length > maxLen ? s.substring(0, maxLen) : s
 }
@@ -212,7 +221,13 @@ function parseNvidia(raw) {
   var line = String(raw || "").trim().split("\n")[0]
   if (!line) return null
   var parts = line.split(",")
-  if (parts.length < 4) return null
+  // Exactly the five fields this widget asks for in its own --query-gpu argv.
+  // `< 4` used to accept a misaligned line: one stray comma early in the line
+  // (a locale decimal comma, a name containing one) shifts every later field
+  // into the wrong slot, and a silently misaligned sample is worse than none —
+  // it renders a real temperature as VRAM and a real VRAM figure as watts.
+  // The caller keeps the last good sample when this returns null.
+  if (parts.length !== 5) return null
 
   function value(index) {
     var text = String(parts[index] || "").trim()
@@ -223,12 +238,14 @@ function parseNvidia(raw) {
     return isFinite(n) && n <= 1e9 ? n : -1
   }
 
+  // Clamped to plausible sensor ranges: a percentage above 100 or a fanless
+  // card reporting 8192 W is a parse artifact, and the UI prints it verbatim.
   return {
-    busy: value(0),
-    tempC: value(1),
+    busy: clamp(value(0), -1, 100),
+    tempC: clamp(value(1), -1, 150),
     vramUsedBytes: value(2) >= 0 ? value(2) * 1048576 : -1,
     vramTotalBytes: value(3) >= 0 ? value(3) * 1048576 : -1,
-    watts: parts.length > 4 ? value(4) : -1
+    watts: clamp(value(4), -1, 2000)
   }
 }
 
