@@ -40,7 +40,7 @@ Clicking the widget opens an Omarchy keyboard-driven popup panel anchored to the
 - **60s CPU load sparkline** — live history trend buffer sampled while open (zero background cost when closed).
 - **Processor details** — full CPU model name (without cutoff), load, clock frequency, dynamic temperature color, and 1m/5m/15m load average meters.
 - **Memory breakdown** — used/total GiB visual meter, available, cache, and swap usage.
-- **Top processes** — the top processes sorted by RAM or CPU (switch in the header), with share and CPU% per process, blue ramp bars toward the theme accent. The Group toggle collapses them per application (systemd scope, name fallback) with counts and sums. With grouping off, Chromium-family browsers are disambiguated by role (`[main]`, `[gpu]`, `[ext]`, `[zygote]`…) or by the tab's domain (`brave [mail.google.com]`). That domain has two sources: for an app window it is the URL on the command line; otherwise it is read as a hint from the renderer's own memory, when the kernel lets the shell attach to that process. Treat it as a hint, not as evidence — the page decides what its renderer holds, so a heavily used CDN, or a site that names another domain often enough, decides what the label says. When the attach is refused the row reads `[tab]`. Firefox tabs stay plain. Sampled only while the panel is open (zero cost while closed).
+- **Top processes** — the top processes sorted by RAM or CPU (switch in the header), with share and CPU% per process, blue ramp bars toward the theme accent. The Group toggle collapses them per application (systemd scope, name fallback) with counts and sums. With grouping off, Chromium-family browsers are disambiguated by role (`[main]`, `[gpu]`, `[ext]`, `[zygote]`…) or by the tab's domain (`brave [mail.google.com]`). That domain has two sources: for an app window it is the URL on the command line (a PWA launched with only an app id shows `[app]`); otherwise it is the most frequent host found in the renderer's own memory, when the kernel lets the shell attach to that process — and there is no threshold, so a single URL in that memory is enough to win. Treat it as a hint, not as evidence: the page decides what its renderer holds, so a site can make its row read as a different domain. The row reads `[tab]` when the attach is refused or nothing was found. Firefox tabs stay plain. Sampled only while the panel is open (zero cost while closed).
 - **Graphics metrics** — full GPU card name, load, dynamic temperature color, VRAM meter, power draw (W), fan RPM, and clock speeds.
 - **Keyboard navigation** — `Escape` to close, `Tab`/`Shift+Tab` to switch panels, `r` to resample, `c`/`f` to toggle °C/°F.
 
@@ -83,12 +83,12 @@ polled through `nvidia-smi` on the same interval.
 `/run/user/<uid>/hw_monitor_browser_cache.json` (0600, tmpfs, cleared on
 logout). It holds, for each browser row, the label — **which for a tab is a
 domain you have open** — plus the previous CPU snapshot, so a poll costs 20–40 ms
-instead of re-scanning `/proc` twice. An entry is reused for 45 s (10 s for a
-tab it could not name); note that is the entry's validity, not the file's
-lifetime: the file is only rewritten while the panel is open, so the last set of
-domains stays on tmpfs until logout or until you delete it. Without a writable
-runtime directory the cache is skipped rather than written elsewhere. Deleting
-the file at any time is safe — the next poll rebuilds it.
+instead of re-scanning `/proc` twice. An entry is reused for 45 s, or 10 s for a
+sample that could not be resolved in full; note that is the entry's validity,
+not the file's lifetime: the file is only rewritten while the panel is open, so
+the last set of domains stays on tmpfs until logout or until you delete it.
+Without a writable runtime directory the cache is skipped rather than written
+elsewhere. Deleting the file at any time is safe — the next poll rebuilds it.
 
 ## How it samples
 
