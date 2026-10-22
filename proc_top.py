@@ -332,14 +332,16 @@ MEM_SCAN_MAX_REGIONS = 400
 MEM_SCAN_BUDGET_S = 0.6
 
 # Solo l'host: la path non discrimina (pesarla peggiorava le etichette reali).
-# Un eventuale userinfo (la parte prima della chiocciola) non fa parte
-# dell'host: il gruppo `(?:[^/@\s]*@)?` lo consuma senza catturarlo, così il
-# dominio mostrato è quello DOPO la chiocciola. Senza questo, una sola URL
-# bastava a far mostrare al pannello il dominio civetta scritto nella parte
-# prima — non serve nemmeno il voto di frequenza.
-URL_HOST_RE = re.compile(rb"https?://(?:[^/@\s]*@)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)")
+# Un eventuale userinfo non fa parte dell'host: la parte prima dell'ULTIMA
+# chiocciola dell'authority si consuma senza catturarla. La classe è quella
+# legale per lo userinfo (RFC 3986: alnum e `._~%!$&'()*+,;=:` più `@`), NON
+# "tutto tranne / e @": con una classe larga `https://evil.com?u=x@banca.example`
+# veniva attribuita a banca.example, cioè lo stesso spoof da una sola URL
+# rientrava dalla query string. Escludendo `?`, `#` e `/` il gruppo non può
+# uscire dall'authority, e includendo `@` vince l'ultima chiocciola.
+URL_HOST_RE = re.compile(rb"https?://(?:[A-Za-z0-9._~%!$&'()*+,;=:@]*@)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)")
 CMD_TYPE_RE = re.compile(r"--type=([a-zA-Z][a-zA-Z0-9-]*)")
-APP_URL_RE = re.compile(r"--app=(?:https?://)?(?:[^/@\s]*@)?([a-zA-Z0-9.-]+)")
+APP_URL_RE = re.compile(r"--app=(?:https?://)?(?:[A-Za-z0-9._~%!$&'()*+,;=:@]*@)?([a-zA-Z0-9.-]+)")
 APP_ID_RE = re.compile(r"--app-id=([a-zA-Z0-9]+)")
 UTIL_SUB_RE = re.compile(r"--utility-sub-type=([a-zA-Z0-9_.]+)")
 
@@ -569,7 +571,10 @@ def _fit_label(comm, tag):
     if len(tag) > room:
         cut = tag[:max(1, room - 1)]
         dot = cut.rfind(".")
-        if dot > 0:
+        # Sole soglia `dot > 0` collassava un host tipo `x.bbb…` a `x·`,
+        # buttando via 40 caratteri informativi: serve un punto che lasci
+        # almeno due caratteri di etichetta prima.
+        if dot > 1:
             cut = cut[:dot]
         tag = cut + "\u00b7"
     return sanitize_name("%s [%s]" % (comm, tag))
