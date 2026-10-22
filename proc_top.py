@@ -357,7 +357,7 @@ APP_AUTH_RE = re.compile(r"--app=(?:https?://)?([^/?#\s\"'<>]{1,255})")
 # In quel caso si rinuncia all'etichetta. La garanzia "il userinfo non vince"
 # la porta rsplit(b'@'), non l'ancora né il prefisso.
 _URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
-_HOSTISH_AFTER = re.compile(rb"[a-z0-9._\-%]")
+_HOSTISH_AFTER = re.compile(rb"[a-z0-9._\-%\x80-\xff]")
 # Cioè la stessa classe della cattura: se il byte dopo l'authority sarebbe
 # ANCORA potuto entrarci, la cattura si è fermata al tetto di 255 e va scartata.
 # Un `not after not in b"/?#"` non basta: spazio, virgoletta e `<>` chiudono
@@ -708,17 +708,22 @@ def _scan_hosts(pid, deadline):
                 scanned += len(chunk)
                 for found in URL_AUTH_RE.finditer(chunk):
                     auth = found.group(1)
-                    # La cattura è limitata a 255 byte. Il test giusto non è
-                    # "era lunga" ma "si è fermata a un confine?": se il byte
-                    # dopo sarebbe ancora entrato nell'authority, la cattura è
-                    # stata tagliata dal tetto e rsplit restituirebbe il
-                    # userinfo; se è un delimitatore (`/`, `?`, `#`, spazio,
-                    # virgoletta, `<>`) l'authority è completa e va tenuta. Se
-                    # il chunk finisce lì il dato è ambiguo e si rinuncia.
-                    if len(auth) == 255:
-                        after = chunk[found.end(1):found.end(1) + 1]
-                        if not after or _AUTH_MORE.match(after):
-                            continue
+                    end = found.end(1)
+                    # Un prefisso non nasce solo dal tetto di 255 byte: se la
+                    # cattura finisce esattamente sul bordo del chunk, l'authority
+                    # può continuare oltre la finestra (`https://decoy.example`
+                    # tagliato prima del vero `@banca.example`), quindi `auth` è
+                    # un prefisso anche quando è più corto del tetto. Entrambi i
+                    # casi si scartano: un'etichetta in meno è meglio di una
+                    # civetta.
+                    if end >= len(chunk):
+                        continue
+                    # Troncamento dovuto al tetto: si vede solo se il byte dopo
+                    # sarebbe ancora entrato nell'authority. Un delimitatore
+                    # (`/`, `?`, `#`, spazio, virgoletta, `<>`) la chiude, quindi
+                    # la cattura è completa e va tenuta.
+                    if len(auth) == 255 and _AUTH_MORE.match(chunk[end:end + 1]):
+                        continue
                     raw_host = _authority_host(auth)
                     if raw_host is None:
                         continue
@@ -784,18 +789,19 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
         # tetto della cattura è in CARATTERI (pattern str), quindi il test di
         # troncamento si fa sulla cmdline, non sui byte codificati.
         app_auth = app_match.group(1)
+        end = app_match.end(1)
+        tail = cmdline[end:end + 1]
         truncated = False
-        if len(app_auth) == 255:
-            tail = cmdline[app_match.end(1):app_match.end(1) + 1]
-            if tail:
-                # Troncata solo se il carattere dopo sarebbe ancora entrato
-                # nell'authority. Uno spazio o una virgoletta lo chiudono, quindi
-                # l'authority è completa; `/`, `?`, `#` pure.
-                truncated = bool(_AUTH_MORE_STR.match(tail))
-            else:
-                # Nessun carattere dopo: ambiguo. Se la lettura ha toccato i
-                # 4096 byte, la cattura può essere stata tagliata dal limite.
-                truncated = len(raw_cmdline) >= 4096
+        if tail:
+            # Al tetto: troncata solo se il carattere dopo sarebbe ancora
+            # entrato nell'authority. Spazio o virgoletta la chiudono, quindi
+            # è completa; `/`, `?`, `#` pure.
+            truncated = len(app_auth) == 255 and bool(_AUTH_MORE_STR.match(tail))
+        elif len(raw_cmdline) >= 4096:
+            # Nessun carattere dopo e la lettura ha toccato i 4096 byte:
+            # l'authority può continuare nel cmdline troncato. Vale anche sotto
+            # il tetto di 255 — un prefisso corto è comunque un prefisso.
+            truncated = True
         if not truncated:
             raw_app = _authority_host(app_auth.encode("utf-8", "ignore"))
             host = raw_app.decode("ascii", "ignore") if raw_app else ""
