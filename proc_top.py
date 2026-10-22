@@ -349,9 +349,15 @@ APP_AUTH_RE = re.compile(r"--app=(?:https?://)?([^/?#\s\"'<>]{1,255})")
 # Match di PREFISSO, non ancorato a fine stringa: dopo l'host possono esserci
 # byte legali nella cattura ma non in un host (`url(…com)`, NUL, `&`, `;`).
 # Con il `$` finale quei casi perdevano l'etichetta del tutto; il match greedy
-# prende il prefisso valido più lungo, che per un host vero è l'host intero.
-# La garanzia "il userinfo non vince" la porta rsplit(b'@'), non l'ancora.
+# prende il prefisso valido più lungo. Ma il prefisso vale solo se l'host
+# FINISCE lì: se il byte successivo è ancora "da host" (`_`, `.`, `-`, `%`)
+# allora non è un dominio pulito ma un host più lungo e illeggibile, e
+# restituire il prefisso inventerebbe un dominio plausibile ma falso
+# (`www.ex_ample.com` diventava `www.ex`, `banca.example_x` → `banca.example`).
+# In quel caso si rinuncia all'etichetta. La garanzia "il userinfo non vince"
+# la porta rsplit(b'@'), non l'ancora né il prefisso.
 _URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
+_HOSTISH_AFTER = re.compile(rb"[a-z0-9._\-%]")
 
 
 def _authority_host(auth):
@@ -361,18 +367,17 @@ def _authority_host(auth):
     si valida. Se il risultato non è un dominio mostrabile si restituisce
     None — rinunciare all'etichetta è corretto, mostrare la civetta no.
     """
-    # La cattura è limitata a 255 byte: se è arrivata a fondo scala può essersi
-    # fermata DENTRO il userinfo (`login@banca.example…` troncato prima della
-    # chiocciola vera), e rsplit restituirebbe la civetta. Una cattura più
-    # corta si è fermata a un delimitatore, quindi è completa.
-    if len(auth) >= 255:
-        return None
     host = auth.rsplit(b"@", 1)[-1]
     if host.startswith(b"["):
         return None                      # letterale IPv6: non è un dominio
     host = host.split(b":", 1)[0].lower().rstrip(b".")
     match = _URL_HOST_OK.match(host)
-    return match.group(0) if match else None
+    if not match:
+        return None
+    after = host[match.end():match.end() + 1]
+    if after and _HOSTISH_AFTER.match(after):
+        return None                      # l'host continua: non è pulito
+    return match.group(0)
 
 
 CMD_TYPE_RE = re.compile(r"--type=([a-zA-Z][a-zA-Z0-9-]*)")
@@ -694,7 +699,18 @@ def _scan_hosts(pid, deadline):
                         break
                     continue
                 scanned += len(chunk)
-                for auth in URL_AUTH_RE.findall(chunk):
+                for found in URL_AUTH_RE.finditer(chunk):
+                    auth = found.group(1)
+                    # La cattura è limitata a 255 byte: se ha toccato il tetto e
+                    # il byte dopo non è un delimitatore, si è fermata DENTRO
+                    # l'authority (tipicamente nel userinfo) e rsplit
+                    # restituirebbe la civetta. Il test giusto è "si è fermata a
+                    # un delimitatore?", non "era lunga": una cattura di 255 byte
+                    # seguita da `/` è completa e va tenuta.
+                    if len(auth) == 255:
+                        after = chunk[found.end(1):found.end(1) + 1]
+                        if after and after not in b"/?#":
+                            continue
                     raw_host = _authority_host(auth)
                     if raw_host is None:
                         continue
@@ -755,11 +771,19 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
 
     app_match = APP_AUTH_RE.search(cmdline)
     if app_match:
-        # Stessa regola dell'host di memoria: il userinfo non è l'host.
-        raw_app = _authority_host(app_match.group(1).encode("utf-8", "ignore"))
-        host = raw_app.decode("ascii", "ignore") if raw_app else ""
-        if host:
-            label = _fit_label(comm, host)
+        # Stessa regola dell'host di memoria: il userinfo non è l'host. Qui il
+        # tetto della cattura è in CARATTERI (pattern str), quindi il test di
+        # troncamento si fa sulla cmdline, non sui byte codificati.
+        app_auth = app_match.group(1)
+        truncated = False
+        if len(app_auth) == 255:
+            tail = cmdline[app_match.end(1):app_match.end(1) + 1]
+            truncated = bool(tail) and tail not in "/?#"
+        if not truncated:
+            raw_app = _authority_host(app_auth.encode("utf-8", "ignore"))
+            host = raw_app.decode("ascii", "ignore") if raw_app else ""
+            if host:
+                label = _fit_label(comm, host)
 
     if label is None:
         ctype = CMD_TYPE_RE.search(cmdline)
