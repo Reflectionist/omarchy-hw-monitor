@@ -346,7 +346,12 @@ MEM_SCAN_BUDGET_S = 0.6
 # larga lasciava rientrare lo spoof dalla query string.
 URL_AUTH_RE = re.compile(rb"https?://([^/?#\s\"'<>]{1,255})")
 APP_AUTH_RE = re.compile(r"--app=(?:https?://)?([^/?#\s\"'<>]{1,255})")
-_URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
+# Match di PREFISSO, non ancorato a fine stringa: dopo l'host possono esserci
+# byte legali nella cattura ma non in un host (`url(…com)`, NUL, `&`, `;`).
+# Con il `$` finale quei casi perdevano l'etichetta del tutto; il match greedy
+# prende il prefisso valido più lungo, che per un host vero è l'host intero.
+# La garanzia "il userinfo non vince" la porta rsplit(b'@'), non l'ancora.
+_URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 
 
 def _authority_host(auth):
@@ -356,11 +361,18 @@ def _authority_host(auth):
     si valida. Se il risultato non è un dominio mostrabile si restituisce
     None — rinunciare all'etichetta è corretto, mostrare la civetta no.
     """
+    # La cattura è limitata a 255 byte: se è arrivata a fondo scala può essersi
+    # fermata DENTRO il userinfo (`login@banca.example…` troncato prima della
+    # chiocciola vera), e rsplit restituirebbe la civetta. Una cattura più
+    # corta si è fermata a un delimitatore, quindi è completa.
+    if len(auth) >= 255:
+        return None
     host = auth.rsplit(b"@", 1)[-1]
     if host.startswith(b"["):
         return None                      # letterale IPv6: non è un dominio
     host = host.split(b":", 1)[0].lower().rstrip(b".")
-    return host if _URL_HOST_OK.match(host) else None
+    match = _URL_HOST_OK.match(host)
+    return match.group(0) if match else None
 
 
 CMD_TYPE_RE = re.compile(r"--type=([a-zA-Z][a-zA-Z0-9-]*)")
