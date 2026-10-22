@@ -181,7 +181,9 @@ Panel {
     id: tempMetrics
     font.family: root.fontFamily
     font.pixelSize: root.valueSize
-    text: "100°C"
+    // Reserve a three-digit reading in the chosen format, so "degree" and
+    // "bare" don't carry the width of a unit they never show.
+    text: root.tempText(100)
   }
 
   // Representative widest figure per RAM format; the cell never shrinks below
@@ -588,7 +590,9 @@ Panel {
 
       // Every figure cell reserves its slot width: a single-digit value keeps
       // an invisible trailing gap instead of pulling its neighbours around.
-      // The old trail-only reservation is subsumed by this.
+      // The old trail-only reservation is subsumed by this. The slot covers the
+      // last cell too, so the bar never re-lays itself out when the final
+      // reading gains or loses a digit.
       readonly property int figureSlot: group.isTempCell ? root.tempSlot
         : (modelData.key === "ram" ? root.ramSlot : root.percentSlot)
       readonly property real slack: root.showValues
