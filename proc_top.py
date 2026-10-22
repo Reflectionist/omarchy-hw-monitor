@@ -332,16 +332,38 @@ MEM_SCAN_MAX_REGIONS = 400
 MEM_SCAN_BUDGET_S = 0.6
 
 # Solo l'host: la path non discrimina (pesarla peggiorava le etichette reali).
-# Un eventuale userinfo non fa parte dell'host: la parte prima dell'ULTIMA
-# chiocciola dell'authority si consuma senza catturarla. La classe è quella
-# legale per lo userinfo (RFC 3986: alnum e `._~%!$&'()*+,;=:` più `@`), NON
-# "tutto tranne / e @": con una classe larga `https://evil.com?u=x@banca.example`
-# veniva attribuita a banca.example, cioè lo stesso spoof da una sola URL
-# rientrava dalla query string. Escludendo `?`, `#` e `/` il gruppo non può
-# uscire dall'authority, e includendo `@` vince l'ultima chiocciola.
-URL_HOST_RE = re.compile(rb"https?://(?:[A-Za-z0-9._~%!$&'()*+,;=:@]*@)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)")
+# L'authority si cattura INTERA (`[^/?#\s"'<>]`, al massimo 255 byte: la lunghezza
+# massima di un nome host) e l'host si estrae dopo, in `_authority_host`.
+# Non si prova a esprimerlo in una sola regex: un gruppo opzionale
+# `(?:userinfo@)?` seguito dall'host fa vincere il userinfo ogni volta che
+# l'host vero NON è esprimibile come `a.b` — `@intranet`, `@localhost`,
+# `@[::1]`, `@host_con_underscore` — perché il motore torna indietro alla
+# chiocciola precedente e cattura la civetta. Cioè il difetto restava,
+# solo spostato sui nomi a etichetta singola. Con la cattura strutturale
+# ("l'host è ciò che segue l'ultima chiocciola") il userinfo non può più
+# vincere per costruzione, non per effetto collaterale del backtracking.
+# Gli esclusi `?`, `#`, `/` tengono lo scan dentro l'authority; una classe
+# larga lasciava rientrare lo spoof dalla query string.
+URL_AUTH_RE = re.compile(rb"https?://([^/?#\s\"'<>]{1,255})")
+APP_AUTH_RE = re.compile(r"--app=(?:https?://)?([^/?#\s\"'<>]{1,255})")
+_URL_HOST_OK = re.compile(rb"[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
+
+
+def _authority_host(auth):
+    """Host da un authority URL, oppure None. Il userinfo non vince mai.
+
+    Strutturale: si tiene il segmento dopo l'ultima `@`, si toglie la porta,
+    si valida. Se il risultato non è un dominio mostrabile si restituisce
+    None — rinunciare all'etichetta è corretto, mostrare la civetta no.
+    """
+    host = auth.rsplit(b"@", 1)[-1]
+    if host.startswith(b"["):
+        return None                      # letterale IPv6: non è un dominio
+    host = host.split(b":", 1)[0].lower().rstrip(b".")
+    return host if _URL_HOST_OK.match(host) else None
+
+
 CMD_TYPE_RE = re.compile(r"--type=([a-zA-Z][a-zA-Z0-9-]*)")
-APP_URL_RE = re.compile(r"--app=(?:https?://)?(?:[A-Za-z0-9._~%!$&'()*+,;=:@]*@)?([a-zA-Z0-9.-]+)")
 APP_ID_RE = re.compile(r"--app-id=([a-zA-Z0-9]+)")
 UTIL_SUB_RE = re.compile(r"--utility-sub-type=([a-zA-Z0-9_.]+)")
 
@@ -583,10 +605,19 @@ def _fit_label(comm, tag):
 # Nessun latch globale sull'accesso a /proc/<pid>/mem. La leggibilità è una
 # proprietà del singolo processo: i figli Chromium chiamano
 # PR_SET_PTRACER_ANY e sono leggibili anche con yama ptrace_scope=1, mentre
-# main/zygote/gpu non lo sono. Un latch rendeva l'ordine delle righe — cioè
-# l'ordinamento per RSS/CPU — responsabile di quale browser perdeva
-# l'etichetta. Un open() fallito costa una syscall, e il budget vero è già
-# dentro _scan_hosts (byte, regioni, scadenza).
+# main/zygote/gpu non lo sono. Un latch faceva sì che un solo renderer
+# illeggibile sopprimesse l'etichetta di TUTTI gli altri. Un open() fallito
+# costa una syscall, e il budget vero è già dentro _scan_hosts (byte,
+# regioni, scadenza).
+#
+# Resta però un accoppiamento sull'ORDINE, di tipo diverso: la scadenza è una
+# sola, creata prima del ciclo delle righe e condivisa da tutti i _scan_hosts.
+# Un renderer ostile può bruciarla (misurato: ~21 ms per 512 KiB, quindi fino
+# a ~0,35 s degli 0,6 s con un buffer da 8 MiB) e le righe scandite dopo
+# ricevono `[tab]` con TTL 10 s pur essendo perfettamente leggibili. Il latch
+# non c'è più, ma "l'ordine non decide più chi perde l'etichetta" non sarebbe
+# vero: decide ancora, per tempo invece che per booleano. Effetto: un hint
+# degrada al suo fallback documentato.
 
 
 def _scan_hosts(pid, deadline):
@@ -651,8 +682,11 @@ def _scan_hosts(pid, deadline):
                         break
                     continue
                 scanned += len(chunk)
-                for raw_host in URL_HOST_RE.findall(chunk):
-                    host = raw_host.decode("ascii", "ignore").lower()
+                for auth in URL_AUTH_RE.findall(chunk):
+                    raw_host = _authority_host(auth)
+                    if raw_host is None:
+                        continue
+                    host = raw_host.decode("ascii", "ignore")
                     if host in IGNORE_BROWSER_HOSTS or host.endswith(IGNORE_BROWSER_SUFFIXES):
                         continue
                     counts[host] = counts.get(host, 0) + 1
@@ -707,9 +741,11 @@ def enrich_browser_label(pid, comm, cache=None, now=None, deadline=None):
     label = None
     resolved = True
 
-    app_match = APP_URL_RE.search(cmdline)
+    app_match = APP_AUTH_RE.search(cmdline)
     if app_match:
-        host = app_match.group(1).strip(".").lower()
+        # Stessa regola dell'host di memoria: il userinfo non è l'host.
+        raw_app = _authority_host(app_match.group(1).encode("utf-8", "ignore"))
+        host = raw_app.decode("ascii", "ignore") if raw_app else ""
         if host:
             label = _fit_label(comm, host)
 
